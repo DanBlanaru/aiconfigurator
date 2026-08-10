@@ -6,7 +6,65 @@ from __future__ import annotations
 import aiconfigurator_core.sdk.operations as ops
 from aiconfigurator_core.sdk import common
 from aiconfigurator_core.sdk.models.base import BaseModel, register_model
-from aiconfigurator_core.sdk.models.helpers import mtp_scale_factor
+from aiconfigurator_core.sdk.models.helpers import (
+    _is_routing_expert_target,
+    _normalize_mixed_precision_layer_algo,
+    mtp_scale_factor,
+)
+
+
+def _qwen35_mixed_precision_gemm_modes(
+    raw_config: dict, default: common.GEMMQuantMode
+) -> tuple[common.GEMMQuantMode, common.GEMMQuantMode, common.GEMMQuantMode]:
+    """Resolve Qwen3.6 projection and FFN modes from per-layer ModelOpt metadata."""
+    modes = {
+        "projection": default,
+        "dense_ffn": default,
+        "shared_expert": default,
+    }
+    algo_modes = {
+        "fp8": common.GEMMQuantMode.fp8_static,
+        "mxfp8": common.GEMMQuantMode.fp8,
+        "nvfp4": common.GEMMQuantMode.nvfp4,
+    }
+
+    quantized_layers = []
+    hf_quant = raw_config.get("hf_quant_config")
+    if isinstance(hf_quant, dict):
+        quantization = hf_quant.get("quantization")
+        if isinstance(quantization, dict):
+            quantized_layers.append(quantization.get("quantized_layers"))
+    quantization = raw_config.get("quantization_config")
+    if isinstance(quantization, dict):
+        quantized_layers.append(quantization.get("quantized_layers"))
+
+    for layer_map in quantized_layers:
+        if not isinstance(layer_map, dict):
+            continue
+        for target, metadata in layer_map.items():
+            algo_value = (
+                metadata.get("quant_algo") or metadata.get("quantization_algo") or metadata.get("quant_method")
+                if isinstance(metadata, dict)
+                else metadata
+            )
+            mode = algo_modes.get(_normalize_mixed_precision_layer_algo(algo_value))
+            if mode is None:
+                continue
+            target_name = str(target).lower()
+            if ".linear_attn." in target_name or ".self_attn." in target_name:
+                modes["projection"] = mode
+            elif "shared_expert" in target_name:
+                modes["shared_expert"] = mode
+            elif ".mlp." in target_name and not _is_routing_expert_target(target_name):
+                modes["dense_ffn"] = mode
+
+    if modes["projection"] != default:
+        # A caller-selected global mode takes precedence over checkpoint
+        # defaults. Only split the paths when the global mode matches the
+        # checkpoint's projection mode inferred by the generic loader.
+        return default, default, default
+
+    return modes["projection"], modes["dense_ffn"], modes["shared_expert"]
 
 
 @register_model("QWEN35")
@@ -39,12 +97,19 @@ class Qwen35Model(BaseModel):
             model_info["context"],
             model_config,
             model_info["extra_params"],
+            raw_config=model_info["raw_config"],
         )
 
-    def __init__(self, *args) -> None:
+    def __init__(self, *args, raw_config: dict | None = None) -> None:
         super().__init__(*args)
         cfg: common.Qwen35Config = self.extra_params
         assert isinstance(cfg, common.Qwen35Config), "Qwen35Model requires Qwen35Config extra_params"
+
+        (
+            self._projection_gemm_quant_mode,
+            self._dense_ffn_gemm_quant_mode,
+            self._shared_expert_gemm_quant_mode,
+        ) = _qwen35_mixed_precision_gemm_modes(raw_config or {}, self.config.gemm_quant_mode)
 
         self._mtp_scale_factor = mtp_scale_factor(self._nextn, self._num_layers)
 
@@ -77,7 +142,9 @@ class Qwen35Model(BaseModel):
         moe_tp = self.config.moe_tp_size
         moe_ep = self.config.moe_ep_size
         attn_dp = self.config.attention_dp_size
-        gemm_q = self.config.gemm_quant_mode
+        projection_gemm_q = self._projection_gemm_quant_mode
+        dense_ffn_gemm_q = self._dense_ffn_gemm_quant_mode
+        shared_expert_gemm_q = self._shared_expert_gemm_quant_mode
         kvcache_q = self.config.kvcache_quant_mode
         fmha_q = self.config.fmha_quant_mode
         moe_q = self.config.moe_quant_mode
@@ -113,7 +180,7 @@ class Qwen35Model(BaseModel):
             self.context_ops.extend(
                 [
                     ops.ElementWise("context_gdn_norm", c, 2 * h, 2 * h, 0.8),
-                    ops.GEMM("context_gdn_in_proj_gemm", c, gdn_in_proj_out, h, gemm_q),
+                    ops.GEMM("context_gdn_in_proj_gemm", c, gdn_in_proj_out, h, projection_gemm_q),
                     ops.GDNKernel(
                         "context_gdn_conv1d",
                         c,
@@ -138,13 +205,31 @@ class Qwen35Model(BaseModel):
                         hv,
                         d_conv,
                     ),
-                    ops.GEMM("context_gdn_out_proj_gemm", c, h, gdn_out_proj_in, gemm_q, low_precision_input=True),
+                    ops.GEMM(
+                        "context_gdn_out_proj_gemm",
+                        c,
+                        h,
+                        gdn_out_proj_in,
+                        projection_gemm_q,
+                        low_precision_input=True,
+                    ),
                     ops.CustomAllReduce("context_gdn_ar", c, h, tp),
                 ]
             )
             self.context_ops.extend(
                 self._ffn_context_ops(
-                    "context_gdn", c, h, tp, moe_tp, moe_ep, attn_dp, gemm_q, moe_q, workload_dist, cfg
+                    "context_gdn",
+                    c,
+                    h,
+                    tp,
+                    moe_tp,
+                    moe_ep,
+                    attn_dp,
+                    dense_ffn_gemm_q,
+                    shared_expert_gemm_q,
+                    moe_q,
+                    workload_dist,
+                    cfg,
                 )
             )
 
@@ -155,7 +240,7 @@ class Qwen35Model(BaseModel):
             self.context_ops.extend(
                 [
                     ops.ElementWise("context_full_attn_norm", c, 2 * h, 2 * h, 0.8),
-                    ops.GEMM("context_qkv_gemm", c, qkv_out, h, gemm_q),
+                    ops.GEMM("context_qkv_gemm", c, qkv_out, h, projection_gemm_q),
                     ops.ContextAttention(
                         "context_attention",
                         c,
@@ -165,13 +250,31 @@ class Qwen35Model(BaseModel):
                         fmha_q,
                         head_size=self._head_size,
                     ),
-                    ops.GEMM("context_proj_gemm", c, h, n_q_per_tp * self._head_size, gemm_q, low_precision_input=True),
+                    ops.GEMM(
+                        "context_proj_gemm",
+                        c,
+                        h,
+                        n_q_per_tp * self._head_size,
+                        projection_gemm_q,
+                        low_precision_input=True,
+                    ),
                     ops.CustomAllReduce("context_full_ar", c, h, tp),
                 ]
             )
             self.context_ops.extend(
                 self._ffn_context_ops(
-                    "context_full", c, h, tp, moe_tp, moe_ep, attn_dp, gemm_q, moe_q, workload_dist, cfg
+                    "context_full",
+                    c,
+                    h,
+                    tp,
+                    moe_tp,
+                    moe_ep,
+                    attn_dp,
+                    dense_ffn_gemm_q,
+                    shared_expert_gemm_q,
+                    moe_q,
+                    workload_dist,
+                    cfg,
                 )
             )
 
@@ -183,7 +286,19 @@ class Qwen35Model(BaseModel):
         )
 
     def _ffn_context_ops(
-        self, prefix, count, h, tp, moe_tp, moe_ep, attn_dp, gemm_q, moe_q, workload_dist, cfg: common.Qwen35Config
+        self,
+        prefix,
+        count,
+        h,
+        tp,
+        moe_tp,
+        moe_ep,
+        attn_dp,
+        dense_ffn_gemm_q,
+        shared_expert_gemm_q,
+        moe_q,
+        workload_dist,
+        cfg: common.Qwen35Config,
     ):
         """Return FFN ops for context phase: dense SwiGLU or MoE."""
         ops_list = [ops.ElementWise(f"{prefix}_ffn_norm", count, 2 * h, 2 * h, 0.8)]
@@ -236,7 +351,13 @@ class Qwen35Model(BaseModel):
             if cfg.shared_expert_inter_size > 0:
                 ops_list.extend(
                     [
-                        ops.GEMM(f"{prefix}_shared_up_gemm", count, cfg.shared_expert_inter_size // tp, h, gemm_q),
+                        ops.GEMM(
+                            f"{prefix}_shared_up_gemm",
+                            count,
+                            cfg.shared_expert_inter_size // tp,
+                            h,
+                            shared_expert_gemm_q,
+                        ),
                         ops.ElementWise(
                             f"{prefix}_shared_relu2",
                             count,
@@ -249,7 +370,7 @@ class Qwen35Model(BaseModel):
                             count,
                             h,
                             cfg.shared_expert_inter_size // tp,
-                            gemm_q,
+                            shared_expert_gemm_q,
                             low_precision_input=True,
                         ),
                     ]
@@ -257,11 +378,24 @@ class Qwen35Model(BaseModel):
         else:
             ops_list.extend(
                 [
-                    ops.GEMM(f"{prefix}_gate_ffn1_gemm", count, 2 * self._inter_size // tp, h, gemm_q),
+                    ops.GEMM(
+                        f"{prefix}_gate_ffn1_gemm",
+                        count,
+                        2 * self._inter_size // tp,
+                        h,
+                        dense_ffn_gemm_q,
+                    ),
                     ops.ElementWise(
                         f"{prefix}_act_gate", count, 2 * self._inter_size // tp, self._inter_size // tp, 0.8
                     ),
-                    ops.GEMM(f"{prefix}_ffn2_gemm", count, h, self._inter_size // tp, gemm_q, low_precision_input=True),
+                    ops.GEMM(
+                        f"{prefix}_ffn2_gemm",
+                        count,
+                        h,
+                        self._inter_size // tp,
+                        dense_ffn_gemm_q,
+                        low_precision_input=True,
+                    ),
                     ops.CustomAllReduce(f"{prefix}_ffn_ar", count, h, tp),
                 ]
             )
@@ -275,7 +409,9 @@ class Qwen35Model(BaseModel):
         moe_tp = self.config.moe_tp_size
         moe_ep = self.config.moe_ep_size
         attn_dp = self.config.attention_dp_size
-        gemm_q = self.config.gemm_quant_mode
+        projection_gemm_q = self._projection_gemm_quant_mode
+        dense_ffn_gemm_q = self._dense_ffn_gemm_quant_mode
+        shared_expert_gemm_q = self._shared_expert_gemm_quant_mode
         kvcache_q = self.config.kvcache_quant_mode
         moe_q = self.config.moe_quant_mode
         workload_dist = (
@@ -309,7 +445,7 @@ class Qwen35Model(BaseModel):
             self.generation_ops.extend(
                 [
                     ops.ElementWise("generation_gdn_norm", c, 2 * h, 2 * h, 0.8),
-                    ops.GEMM("generation_gdn_in_proj_gemm", c, gdn_in_proj_out, h, gemm_q),
+                    ops.GEMM("generation_gdn_in_proj_gemm", c, gdn_in_proj_out, h, projection_gemm_q),
                     ops.GDNKernel(
                         "generation_gdn_conv1d",
                         c,
@@ -334,13 +470,31 @@ class Qwen35Model(BaseModel):
                         hv,
                         d_conv,
                     ),
-                    ops.GEMM("generation_gdn_out_proj_gemm", c, h, gdn_out_proj_in, gemm_q, low_precision_input=True),
+                    ops.GEMM(
+                        "generation_gdn_out_proj_gemm",
+                        c,
+                        h,
+                        gdn_out_proj_in,
+                        projection_gemm_q,
+                        low_precision_input=True,
+                    ),
                     ops.CustomAllReduce("generation_gdn_ar", c, h, tp),
                 ]
             )
             self.generation_ops.extend(
                 self._ffn_generation_ops(
-                    "generation_gdn", c, h, tp, moe_tp, moe_ep, attn_dp, gemm_q, moe_q, workload_dist, cfg
+                    "generation_gdn",
+                    c,
+                    h,
+                    tp,
+                    moe_tp,
+                    moe_ep,
+                    attn_dp,
+                    dense_ffn_gemm_q,
+                    shared_expert_gemm_q,
+                    moe_q,
+                    workload_dist,
+                    cfg,
                 )
             )
 
@@ -351,7 +505,7 @@ class Qwen35Model(BaseModel):
             self.generation_ops.extend(
                 [
                     ops.ElementWise("generation_full_attn_norm", c, 2 * h, 2 * h, 0.8),
-                    ops.GEMM("generation_qkv_gemm", c, qkv_out, h, gemm_q),
+                    ops.GEMM("generation_qkv_gemm", c, qkv_out, h, projection_gemm_q),
                     ops.GenerationAttention(
                         "generation_attention",
                         c,
@@ -361,14 +515,30 @@ class Qwen35Model(BaseModel):
                         head_size=self._head_size,
                     ),
                     ops.GEMM(
-                        "generation_proj_gemm", c, h, n_q_per_tp * self._head_size, gemm_q, low_precision_input=True
+                        "generation_proj_gemm",
+                        c,
+                        h,
+                        n_q_per_tp * self._head_size,
+                        projection_gemm_q,
+                        low_precision_input=True,
                     ),
                     ops.CustomAllReduce("generation_full_ar", c, h, tp),
                 ]
             )
             self.generation_ops.extend(
                 self._ffn_generation_ops(
-                    "generation_full", c, h, tp, moe_tp, moe_ep, attn_dp, gemm_q, moe_q, workload_dist, cfg
+                    "generation_full",
+                    c,
+                    h,
+                    tp,
+                    moe_tp,
+                    moe_ep,
+                    attn_dp,
+                    dense_ffn_gemm_q,
+                    shared_expert_gemm_q,
+                    moe_q,
+                    workload_dist,
+                    cfg,
                 )
             )
 
@@ -380,7 +550,19 @@ class Qwen35Model(BaseModel):
         )
 
     def _ffn_generation_ops(
-        self, prefix, count, h, tp, moe_tp, moe_ep, attn_dp, gemm_q, moe_q, workload_dist, cfg: common.Qwen35Config
+        self,
+        prefix,
+        count,
+        h,
+        tp,
+        moe_tp,
+        moe_ep,
+        attn_dp,
+        dense_ffn_gemm_q,
+        shared_expert_gemm_q,
+        moe_q,
+        workload_dist,
+        cfg: common.Qwen35Config,
     ):
         """Return FFN ops for generation phase: dense SwiGLU or MoE."""
         ops_list = [ops.ElementWise(f"{prefix}_ffn_norm", count, 2 * h, 2 * h, 0.8)]
@@ -433,7 +615,13 @@ class Qwen35Model(BaseModel):
             if cfg.shared_expert_inter_size > 0:
                 ops_list.extend(
                     [
-                        ops.GEMM(f"{prefix}_shared_up_gemm", count, cfg.shared_expert_inter_size // tp, h, gemm_q),
+                        ops.GEMM(
+                            f"{prefix}_shared_up_gemm",
+                            count,
+                            cfg.shared_expert_inter_size // tp,
+                            h,
+                            shared_expert_gemm_q,
+                        ),
                         ops.ElementWise(
                             f"{prefix}_shared_relu2",
                             count,
@@ -446,7 +634,7 @@ class Qwen35Model(BaseModel):
                             count,
                             h,
                             cfg.shared_expert_inter_size // tp,
-                            gemm_q,
+                            shared_expert_gemm_q,
                             low_precision_input=True,
                         ),
                     ]
@@ -454,11 +642,24 @@ class Qwen35Model(BaseModel):
         else:
             ops_list.extend(
                 [
-                    ops.GEMM(f"{prefix}_gate_ffn1_gemm", count, 2 * self._inter_size // tp, h, gemm_q),
+                    ops.GEMM(
+                        f"{prefix}_gate_ffn1_gemm",
+                        count,
+                        2 * self._inter_size // tp,
+                        h,
+                        dense_ffn_gemm_q,
+                    ),
                     ops.ElementWise(
                         f"{prefix}_act_gate", count, 2 * self._inter_size // tp, self._inter_size // tp, 0.8
                     ),
-                    ops.GEMM(f"{prefix}_ffn2_gemm", count, h, self._inter_size // tp, gemm_q, low_precision_input=True),
+                    ops.GEMM(
+                        f"{prefix}_ffn2_gemm",
+                        count,
+                        h,
+                        self._inter_size // tp,
+                        dense_ffn_gemm_q,
+                        low_precision_input=True,
+                    ),
                     ops.CustomAllReduce(f"{prefix}_ffn_ar", count, h, tp),
                 ]
             )
